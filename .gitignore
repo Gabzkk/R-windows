@@ -1,0 +1,9 @@
+bin/
+obj/
+*.exe
+*.dll
+*.o
+*.obj
+__pycache__/
+*.pyc
+*.log
